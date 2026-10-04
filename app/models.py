@@ -381,6 +381,8 @@ class UnloadingExecution(Base):
     remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
     # 进度版本：创建时为 0，每成功登记一箱 +1
     progress_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # 区间版本：冻结时为 0，每次区间调整申请成功后原子 +1
+    window_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     frozen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
@@ -388,6 +390,12 @@ class UnloadingExecution(Base):
         back_populates="execution", cascade="all, delete-orphan"
     )
     ports: Mapped[list["UnloadingFrozenPort"]] = relationship(
+        back_populates="execution", cascade="all, delete-orphan"
+    )
+    effective_ports: Mapped[list["UnloadingEffectivePort"]] = relationship(
+        back_populates="execution", cascade="all, delete-orphan"
+    )
+    adjustments: Mapped[list["UnloadingWindowAdjustment"]] = relationship(
         back_populates="execution", cascade="all, delete-orphan"
     )
     steps: Mapped[list["UnloadingExecStep"]] = relationship(
@@ -400,6 +408,7 @@ class UnloadingExecution(Base):
 
     __table_args__ = (
         CheckConstraint("progress_version >= 0", name="uq_exec_version_nonneg"),
+        CheckConstraint("window_version >= 0", name="ck_exec_window_version_nonneg"),
     )
 
 
@@ -501,6 +510,85 @@ class UnloadingExecOperation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     execution: Mapped[UnloadingExecution] = relationship(back_populates="operations")
+
+
+class UnloadingEffectivePort(Base):
+    """当前生效的各卸港允许剩余总力矩闭区间。
+
+    首次登记冻结时按原定区间逐行复制（区间版本 0）；执行中的区间调整申请
+    成功后整体原子替换为调整后区间（区间版本 +1）。后续卸箱登记的力矩
+    校验与剩余推荐顺序均使用本表；未列港沿用原区间，故每次替换覆盖全部
+    卸港。冻结原区间（unloading_frozen_ports）与已卸步骤永不改变。
+    """
+
+    __tablename__ = "unloading_effective_ports"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    execution_id: Mapped[int] = mapped_column(
+        ForeignKey("unloading_executions.id", ondelete="CASCADE"), index=True
+    )
+    discharge_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    min_remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
+    max_remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
+
+    execution: Mapped[UnloadingExecution] = relationship(
+        back_populates="effective_ports"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("execution_id", "discharge_order",
+                         name="uq_effective_port_order"),
+    )
+
+
+class UnloadingWindowAdjustment(Base):
+    """一次已成功生效的剩余力矩区间调整申请（申请号全局唯一，支持幂等重试）。
+
+    仅针对已开始（首次登记已冻结）且未完结、方案仍当前的执行进度；申请须
+    携带期望卸箱进度版本与期望区间版本，二者均与当前一致才受理。成功后
+    区间版本原子 +1、生效区间整体替换，已卸步骤与冻结原区间不变。
+    response_snapshot 定格首次成功后的完整执行视图：同申请号同内容重试
+    （即使进度/区间版本已被后续操作推进）直接返回该快照、不重复生效。
+    """
+
+    __tablename__ = "unloading_window_adjustments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    execution_id: Mapped[int] = mapped_column(
+        ForeignKey("unloading_executions.id", ondelete="CASCADE"), nullable=False,
+        index=True,
+    )
+    application_no: Mapped[str] = mapped_column(
+        String(128), nullable=False, unique=True
+    )
+    expected_progress_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_window_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    from_window_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    to_window_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 申请区间条目（规范 JSON：[{order,min,max},...] 按港序号升序）
+    ports_json: Mapped[str] = mapped_column(Text, nullable=False)
+    # 请求内容指纹（申请号+期望进度版本+期望区间版本+申请条目 规范 JSON 的 SHA-256）
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 首次成功后的完整执行视图快照（JSON 文本），供同申请号重试幂等返回
+    response_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    execution: Mapped[UnloadingExecution] = relationship(
+        back_populates="adjustments"
+    )
+
+    __table_args__ = (
+        CheckConstraint("expected_progress_version >= 0",
+                        name="ck_window_adj_expected_progress"),
+        CheckConstraint("expected_window_version >= 0",
+                        name="ck_window_adj_expected_window"),
+        CheckConstraint("from_window_version >= 0",
+                        name="ck_window_adj_from_version"),
+        CheckConstraint("to_window_version >= 1",
+                        name="ck_window_adj_to_version"),
+    )
 
 
 class LoadingActuals(Base):

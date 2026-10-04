@@ -535,16 +535,19 @@ curl -s $BASE/plans/<plan_id>/unloading
 1. **无当前卸箱计划则拒绝**（`409`）：须先生成第六章的逐港卸箱顺序；方案 `draft`/`superseded` 同样 `409`；
 2. **当前港**取剩余箱中最小卸港序号；所选箱须**属于当前港**（否则 `422`）；
 3. 所选箱须位于其堆栈**剩余箱的最上层**（同堆栈上层未卸不得取下下层，否则 `422`）；
-4. 卸后**剩余总力矩须落入该港原定闭区间**（`剩余总力矩 = 上次剩余 − 箱重 × 力臂`，否则 `422`）；
-5. **前瞻可行性**：只有从新状态仍能按**港序、堆栈先后与各港力矩区间**卸完全部剩余箱时才登记；
+4. 卸后**剩余总力矩须落入该港当前生效闭区间**（未调整时即冻结原定区间；
+   `剩余总力矩 = 上次剩余 − 箱重 × 力臂`，否则 `422`）；
+5. **前瞻可行性**：只有从新状态仍能按**港序、堆栈先后与各港当前生效力矩区间**卸完全部剩余箱时才登记；
    所选箱即时合法但走入死局时返回 `422`，响应体随附 `blocked_reason`（求解器给出的中文阻碍原因）、
    `current_port`、`remaining_moment_after`，**说明阻碍且进度不变**。
 
 ### 冻结与生命周期
 
 - **首次登记在 `BEGIN IMMEDIATE` 写锁内冻结**当时的当前卸箱计划（全程箱号顺序）及该计划所用
-  **箱重、槽位力臂与各港力矩区间**（逐行快照）；此后对同一方案修订**重排原计划不改已卸记录，
-  也不改后续核算所用的箱重/力臂/港区间**；
+  **箱重、槽位力臂与各港力矩区间**（逐行快照，即查询中的 `frozen_ports`）；此后对同一方案修订
+  **重排原计划不改已卸记录，也不改冻结的箱重/力臂与原定港区间**；
+  六之二的区间收紧只替换**当前生效区间 `effective_ports`**（初始等于冻结区间），
+  冻结原区间始终保留留档，后续卸箱登记的力矩校验与推荐顺序改用生效区间；
 - 方案修订被新修订确认取代（`superseded`）后，执行进度**只读**：再登记返回 `409`，
   但**历史进度仍可查询**（`status=historical`、`read_only=true`）；
 - 全部箱卸完后进度完结（`completed=true`、`read_only=true`），不再接受登记；
@@ -560,15 +563,93 @@ curl -s $BASE/plans/<plan_id>/unloading
 ### 查询（`GET /api/plans/{plan_id}/unloading/execution`）
 
 返回**已卸步骤**（逐步港序、箱号、箱重/力臂与卸后剩余力矩）、**当前港**、**剩余力矩**、
-**进度版本**与按现有**全程箱号字典序规则**求得的**可行剩余推荐顺序 `recommendation`**
+**进度版本 `progress_version`**、**区间版本 `window_version`** 与按现有
+**全程箱号字典序规则**求得的**可行剩余推荐顺序 `recommendation`**
 （每步含港序、箱号、槽位/堆栈/层、箱重、力臂与卸后剩余力矩；全部卸完为空），另含：
 
 - `planned_next_container`：冻结的**原计划**下一步箱号（现场可改选其他合法箱，两者形成对照）；
 - `frozen`/`frozen_at`：计划是否已被首次登记冻结及冻结时刻；
+- `frozen_ports`：首次登记冻结的各港**原定**剩余力矩闭区间（永不改变，仅留档对照）；
+- `effective_ports`：各港**当前生效**剩余力矩闭区间（区间调整成功后整体替换，
+  后续卸箱登记的力矩校验与 `recommendation` 均使用之；未调整时与 `frozen_ports` 相同）；
+- `adjustments`：区间调整历史（见六之二，按区间版本升序；从未调整为空）；
 - `status`（`current`/`historical`）、`read_only`、`completed`、`initial_moment`。
 
-首次登记**前**查询（已有卸箱计划）返回 `progress_version=0`、`frozen=false` 的预览，
-推荐顺序即原计划；无卸箱顺序或方案不存在返回 `404`。
+首次登记**前**查询（已有卸箱计划）返回 `progress_version=0`、`window_version=0`、
+`frozen=false` 的预览，推荐顺序即原计划；无卸箱顺序或方案不存在返回 `404`。
+
+> 兼容性：首次登记成功响应（及同操作号重试返回的历史快照）保留原有全部字段；
+> 新增字段（`window_version`、`frozen_ports`、`effective_ports`、`adjustments`）
+> 仅在特性上线后新生成的登记快照中出现，查询接口则始终返回完整字段。
+
+## 六之二、执行中收紧剩余力矩安全区间（区间调整申请）
+
+卸箱执行过程中港口收紧剩余力矩安全区间时，可对**已开始（首次登记已冻结）且未完结**、
+方案仍为当前已确认修订的执行进度提交调整申请：
+`POST /api/plans/{plan_id}/unloading/window-adjustments`
+（请求体亦见 `examples/unloading_window_adjustment.json`）。
+
+### 提交字段
+
+| 字段 | 含义 |
+| --- | --- |
+| `application_no` | **全局唯一申请号**（非空字符串）：同号同内容重试返回首次结果，同号异内容（含跨方案复用）冲突 `409` |
+| `expected_progress_version` | **期望卸箱进度版本**（非负整数）：与当前 `progress_version` 不一致（过期或并发登记已推进）返回 `409` |
+| `expected_window_version` | **期望区间版本**（非负整数）：首次冻结为 `0`，每次调整成功原子 `+1`；与当前不一致返回 `409` |
+| `ports[]` | **至少一个**当前港至后续未完成港的新区间条目；港序号不得重复；未列港沿用当前生效区间；不得列已完成港 |
+| `ports[].discharge_order` | 卸港序号（正整数）；须为剩余箱涉及的港序号之一（当前港之前的港已完成，拒绝修改） |
+| `ports[].min_remaining_moment` / `ports[].max_remaining_moment` | 调整后期望闭区间的下/上界：**有限数值**、下界不大于上界，且新区间**包含于原生效区间**（只可收紧，不可放宽） |
+
+### 受理与生效规则（任一不满足均拒绝、状态不变）
+
+1. 方案须已确认且仍为当前修订（`draft`/`superseded` 返回 `409`，取代后历史进度仍只读可查）；
+   执行须已开始（无冻结进度 `409`）且未全部卸完（完结 `409`）；
+2. 期望卸箱进度版本与期望区间版本均与当前一致，否则 `409`（版本过期/并发已推进）；
+3. 显式条目只允许涉及**当前港至后续未完成港**：不存在的港序号、已完成港（含当前港之前的港）
+   均 `422`；区间倒置、非有限数值、条目重复由请求校验直接 `422`；
+4. 每个新闭区间**必须包含于该港当前生效闭区间**（边界按与求解器一致的量级容差比较），
+   放宽任一边界返回 `422`；**未列港沿用当前生效区间**；
+5. **当前剩余总力矩须落入调整后当前港区间**，否则 `422`（不得把船留在区间外）；
+6. 依据**首次执行冻结的箱重、槽位力臂与堆栈**，验证从**未卸箱**仍能按**港序、栈顶规则与
+   逐步新区间**卸完全部剩余箱（整数规划 + Python 全约束复核，与第六章同一求解器）；
+   **无解返回中文原因（`422`）且调整不生效**。
+
+### 成功后的原子变更
+
+- **区间版本原子递增 1**（与生效区间替换、台账写入在同一 `BEGIN IMMEDIATE` 写事务内提交/回滚）；
+- 当前生效区间（`effective_ports`）整体替换为调整后区间（未列港按沿用值写回）；
+- **后续卸箱登记**（六之一）的当前港/栈顶/力矩校验与**推荐顺序**一律使用生效区间；
+- **冻结原区间**（`frozen_ports`）、**已卸步骤**与原有接口字段**全部保留不变**；
+- 查询（六之一）展示生效区间、区间版本与**调整历史 `adjustments`**
+  （含申请号、期望进度/区间版本、`from/to_window_version`、显式条目与生效时刻）。
+
+### 重试与冲突
+
+- **同申请号同内容**（期望进度版本、期望区间版本与条目均一致）重复提交视为重试：
+  不重复生效，返回 `200` 与**首次结果快照**（即使其后进度/区间版本已被其他操作推进，
+  或方案已被新修订取代、进度已完结）；
+- **同申请号异内容**（换期望版本/换条目，或把申请号复用于另一方案）→ **冲突 `409`，状态不变**。
+
+### curl 示例
+
+```bash
+# 提交收紧申请（201=生效，区间版本 +1；请求体亦见 examples/unloading_window_adjustment.json）
+curl -s -X POST $BASE/plans/<plan_id>/unloading/window-adjustments \
+  -H 'Content-Type: application/json' -d @examples/unloading_window_adjustment.json
+
+# 同申请号同内容重试 -> 200 返回首次结果快照；同号异内容（含跨方案）-> 409
+# 期望进度/区间版本过期、方案未开始/已完结/已取代只读 -> 409
+# 列了已完成港或未知港、区间非有限/倒置/放宽出原生效区间、当前剩余力矩不在新区间、
+#   从未卸箱无法按新区间卸完（附中文无解原因）-> 422，状态均不变
+curl -s -X POST $BASE/plans/<plan_id>/unloading/window-adjustments \
+  -H 'Content-Type: application/json' \
+  -d '{"application_no":"WIN-ADJ-20261004-0002","expected_progress_version":2,
+       "expected_window_version":1,
+       "ports":[{"discharge_order":2,"min_remaining_moment":-30,"max_remaining_moment":0}]}'
+
+# 查询：生效区间、区间版本与调整历史随执行视图一并返回
+curl -s $BASE/plans/<plan_id>/unloading/execution
+```
 
 ### curl 示例
 
@@ -760,7 +841,8 @@ docker run -d -p 8000:8000 -v stowage-data:/app/data stowage-service
 | GET | `/api/plans/{plan_id}/unloading` | 查询该方案修订绑定的逐港卸箱顺序（历史顺序可查） |
 | GET | `/api/unloading` | 列出逐港卸箱顺序（默认仅当前；`?historical=true` 含历史） |
 | POST | `/api/plans/{plan_id}/unloading/execute` | **逐港卸箱执行**：现场登记卸下一箱（可偏离预案；当前港+栈顶+港区间+前瞻可行性通过才登记；首次冻结计划/箱重/力臂/港区间；201=登记，200=同操作号同内容重试返回首次快照；409=无计划/未确认或已取代只读/版本过期/同号异内容；422=非法箱项/力矩出区间/新状态无可行后续附阻碍原因） |
-| GET | `/api/plans/{plan_id}/unloading/execution` | 查询卸箱执行进度：已卸步骤、当前港、剩余力矩、进度版本与可行剩余推荐顺序（取代后历史进度仍可查，`read_only=true`） |
+| GET | `/api/plans/{plan_id}/unloading/execution` | 查询卸箱执行进度：已卸步骤、当前港、剩余力矩、进度/区间版本、冻结与生效区间、调整历史与可行剩余推荐顺序（取代后历史进度仍可查，`read_only=true`） |
+| POST | `/api/plans/{plan_id}/unloading/window-adjustments` | **执行中收紧剩余力矩安全区间**：全局唯一申请号+期望卸箱进度版本+期望区间版本+至少一个当前港至后续未完成港的新闭区间（有限、非倒置、包含于原生效区间，未列港沿用，当前剩余力矩须在新区间内，并验证未卸箱仍可按港序/栈顶/逐步新区间卸完）；成功原子递增区间版本并替换生效区间，冻结区间与已卸步骤不变；201=生效，200=同申请号同内容重试返回首次快照；409=未开始/已完结/方案取代只读/版本过期/同号异内容；422=条目非法/放宽区间/当前力矩越界/无解附中文原因且不生效 |
 | GET | `/api/plans` | 列出全部方案 |
 | GET | `/api/plans/{plan_id}` | 查询单个方案 |
 
@@ -926,7 +1008,11 @@ curl -s $BASE/seal-releases/<release_id>      # 按凭证号查；is_current/inv
 curl -s "$BASE/unloading"                 # 当前卸箱顺序
 curl -s "$BASE/unloading?historical=true" # 含历史卸箱顺序
 curl -s $BASE/plans/<plan_id>/unloading   # 按方案修订查卸箱顺序
-curl -s $BASE/plans/<plan_id>/unloading/execution  # 卸箱执行进度（已卸/当前港/剩余力矩/版本/推荐顺序）
+curl -s $BASE/plans/<plan_id>/unloading/execution  # 卸箱执行进度（已卸/当前港/剩余力矩/进度与区间版本/生效区间/调整历史/推荐顺序）
+
+# 执行中收紧剩余力矩安全区间（201=生效；同申请号同内容重试 200；409=版本过期/只读/异内容；422=非法/放宽/无解不生效）
+curl -s -X POST $BASE/plans/<plan_id>/unloading/window-adjustments \
+  -H 'Content-Type: application/json' -d @examples/unloading_window_adjustment.json
 ```
 
 方案响应示例：
@@ -973,18 +1059,18 @@ PYTHONPATH=. pytest -q
 app/
   config.py      # 环境变量配置
   database.py    # 引擎/会话/建表，SQLite WAL、外键、busy_timeout
-  models.py      # ORM：资料修订、方案、方案项、已确认占用、装船排程、卸箱顺序、卸箱执行进度/冻结箱港/已卸步骤/操作台账、实绩事件/基线/更正、交接凭证/逐箱快照、封签清单/扫描记录/放行凭证等
+  models.py      # ORM：资料修订、方案、方案项、已确认占用、装船排程、卸箱顺序、卸箱执行进度/冻结箱港/生效区间/区间调整台账/已卸步骤/操作台账、实绩事件/基线/更正、交接凭证/逐箱快照、封签清单/扫描记录/放行凭证等
   schemas.py     # Pydantic 模式与录入校验
   solver.py      # 配载 MILP 与两阶段优选、应急改配三阶段优选（核心）
   scheduler.py   # 装船时间表（岸桥调度）MILP 与两阶段优选（核心）
   actuals.py     # 装船实绩事件重放引擎：晚到重排、同分钟完工先于开工、全约束校验（核心）
   forecast.py    # 岸桥停机剩余作业预测：在制作业固定、停机缝隙、堆栈先后，makespan+字典序优选（核心）
   unloader.py    # 逐港卸箱顺序 MILP、字典序优选与全约束 Python 复核（核心）
-  services.py    # 业务逻辑、并发安全确认、排程/卸箱顺序/应急改配保存前复核、实绩基线冻结/登记与更正、交接凭证签发（写事务复核/指纹/幂等）与查询、逐港卸箱执行（首次冻结/版本原子核对/栈顶与港区间校验/前瞻可行/操作号幂等）（版本+留档+幂等快照）、封签清单冻结登记/扫描留痕与有效扫描判定/放行凭证签发（写事务复核/指纹/幂等）与失效标示
+  services.py    # 业务逻辑、并发安全确认、排程/卸箱顺序/应急改配保存前复核、实绩基线冻结/登记与更正、交接凭证签发（写事务复核/指纹/幂等）与查询、逐港卸箱执行（首次冻结/版本原子核对/栈顶与港区间校验/前瞻可行/操作号幂等）与执行中区间收紧（期望版本原子核对/仅收紧/当前力矩校验/冻结数据重算可行/区间版本原子递增/申请号幂等）、封签清单冻结登记/扫描留痕与有效扫描判定/放行凭证签发（写事务复核/指纹/幂等）与失效标示
   routers.py     # HTTP 路由
   main.py        # FastAPI 入口
 scripts/entrypoint.sh  # 容器初始化入口（create_all + 幂等补列迁移）
-tests/           # 单元/接口/并发测试（含调度器/卸箱顺序穷举交叉验证、应急改配、实绩重放与更正、剩余作业预测、交接凭证、卸箱执行进度、封签核对与放行凭证）
-examples/        # 请求示例（含 schedule.json、actual_events.json、actual_event_late.json、actual_event_correction.json、remaining_forecast.json、handover.json、seal_manifest.json、seal_scan.json、seal_release.json、unloading.json、unloading_execute.json、restow.json）
+tests/           # 单元/接口/并发测试（含调度器/卸箱顺序穷举交叉验证、应急改配、实绩重放与更正、剩余作业预测、交接凭证、卸箱执行进度、区间收紧调整、封签核对与放行凭证）
+examples/        # 请求示例（含 schedule.json、actual_events.json、actual_event_late.json、actual_event_correction.json、remaining_forecast.json、handover.json、seal_manifest.json、seal_scan.json、seal_release.json、unloading.json、unloading_execute.json、unloading_window_adjustment.json、restow.json）
 Dockerfile / docker-compose.yml / requirements.txt
 ```

@@ -44,6 +44,7 @@ from app.schemas import (
     UnloadingOut,
     UnloadingPortOut,
     UnloadingStepOut,
+    UnloadingWindowAdjustIn,
 )
 
 router = APIRouter()
@@ -412,10 +413,29 @@ def execute_unloading_step(
     "/plans/{plan_id}/unloading/execution",
     response_model=UnloadingExecutionOut,
     responses={404: {"model": MessageOut}},
-    summary="查询卸箱执行进度：已卸步骤、当前港、剩余力矩、进度版本与推荐顺序",
+    summary="查询卸箱执行进度：已卸步骤、当前港、剩余力矩、进度/区间版本、生效区间、调整历史与推荐顺序",
 )
 def get_unloading_execution(plan_id: str, db: Session = Depends(get_db)):
     return _strip_internal(services.get_unloading_execution(db, plan_id))
+
+
+@router.post(
+    "/plans/{plan_id}/unloading/window-adjustments",
+    response_model=UnloadingExecutionOut,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="执行中收紧剩余力矩安全区间（原子递增区间版本；同申请号同内容重试返回首次结果）",
+)
+def adjust_unloading_windows(
+    plan_id: str,
+    body: UnloadingWindowAdjustIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    view, idempotent_hit = services.adjust_unloading_windows(db, plan_id, body)
+    # 同申请号同内容重试返回首次结果（200）；新生效为 201
+    response.status_code = 200 if idempotent_hit else 201
+    return _strip_internal(view)
 
 
 # ---------- 装船实绩登记（事件重放） ----------

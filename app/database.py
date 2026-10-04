@@ -78,6 +78,15 @@ def _apply_lightweight_migrations() -> None:
                      "NOT NULL DEFAULT 1")
             )
 
+    added_executions = columns("unloading_executions")
+    with engine.begin() as conn:
+        if added_executions and "window_version" not in added_executions:
+            # 历史库：已冻结执行尚未发生过区间调整，区间版本均为 0
+            conn.execute(
+                text("ALTER TABLE unloading_executions ADD COLUMN window_version "
+                     "INTEGER NOT NULL DEFAULT 0")
+            )
+
     added_events = columns("loading_actual_events")
     with engine.begin() as conn:
         if added_events:
