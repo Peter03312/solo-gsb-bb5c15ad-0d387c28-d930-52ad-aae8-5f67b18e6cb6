@@ -381,6 +381,10 @@ class UnloadingExecution(Base):
     remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
     # 进度版本：创建时为 0，每成功登记一箱 +1
     progress_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # 区间版本：创建时为 0（=冻结的原定区间），每次区间调整申请生效后 +1
+    window_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     frozen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
@@ -388,6 +392,12 @@ class UnloadingExecution(Base):
         back_populates="execution", cascade="all, delete-orphan"
     )
     ports: Mapped[list["UnloadingFrozenPort"]] = relationship(
+        back_populates="execution", cascade="all, delete-orphan"
+    )
+    effective_ports: Mapped[list["UnloadingEffectivePort"]] = relationship(
+        back_populates="execution", cascade="all, delete-orphan"
+    )
+    adjustments: Mapped[list["UnloadingWindowAdjustment"]] = relationship(
         back_populates="execution", cascade="all, delete-orphan"
     )
     steps: Mapped[list["UnloadingExecStep"]] = relationship(
@@ -400,6 +410,7 @@ class UnloadingExecution(Base):
 
     __table_args__ = (
         CheckConstraint("progress_version >= 0", name="uq_exec_version_nonneg"),
+        CheckConstraint("window_version >= 0", name="uq_exec_window_version_nonneg"),
     )
 
 
@@ -447,6 +458,68 @@ class UnloadingFrozenPort(Base):
         UniqueConstraint("execution_id", "discharge_order",
                          name="uq_frozen_port_order"),
     )
+
+
+class UnloadingEffectivePort(Base):
+    """各卸港当前**生效**的允许剩余总力矩闭区间。
+
+    首次登记时按冻结的原定区间初始化（区间版本 0）；此后每次区间调整申请
+    生效即在同一事务内原子替换为调整后区间（区间版本 +1）。已卸步骤的
+    力矩核算与原冻结区间（UnloadingFrozenPort）均保留不改；后续卸箱登记
+    与剩余推荐顺序一律使用本表的生效区间。
+    """
+
+    __tablename__ = "unloading_effective_ports"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    execution_id: Mapped[int] = mapped_column(
+        ForeignKey("unloading_executions.id", ondelete="CASCADE"), index=True
+    )
+    discharge_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    min_remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
+    max_remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
+
+    execution: Mapped[UnloadingExecution] = relationship(
+        back_populates="effective_ports"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("execution_id", "discharge_order",
+                         name="uq_effective_port_order"),
+    )
+
+
+class UnloadingWindowAdjustment(Base):
+    """收紧剩余力矩安全区间的调整申请留档（每次生效一条，构成调整历史）。
+
+    申请号全局唯一：同号同内容重试返回首次结果快照（200），同号异内容冲突
+    （409）。期望进度版本/区间版本与当前不一致（过期或并发已推进）、方案已
+    被取代、已完成或未开始均拒绝且不生效。
+    """
+
+    __tablename__ = "unloading_window_adjustments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    execution_id: Mapped[int] = mapped_column(
+        ForeignKey("unloading_executions.id", ondelete="CASCADE"), index=True
+    )
+    application_no: Mapped[str] = mapped_column(
+        String(128), nullable=False, unique=True
+    )
+    # 申请时期望的进度版本与区间版本（须与当时当前值一致）
+    expected_progress_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_window_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 生效后的新区间版本（= 申请时区间版本 + 1）
+    new_window_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 申请中列出的调整区间（JSON 文本，按卸港序号升序的 {order,min,max} 列表）
+    windows_json: Mapped[str] = mapped_column(Text, nullable=False)
+    # 首次生效后的完整执行视图快照（JSON 文本），供同申请号重试幂等返回
+    response_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    # 申请内容指纹（application_no+期望版本+区间列表规范 JSON 的 SHA-256）
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    execution: Mapped[UnloadingExecution] = relationship(back_populates="adjustments")
 
 
 class UnloadingExecStep(Base):

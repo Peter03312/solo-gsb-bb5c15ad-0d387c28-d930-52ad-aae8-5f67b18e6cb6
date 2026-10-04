@@ -8,6 +8,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app import __version__
@@ -17,6 +18,23 @@ from app.routers import router
 from app.services import BlockedError, BusinessError, ConflictError
 
 settings = get_settings()
+
+
+def _json_safe(obj):
+    """把校验错误回显中不可 JSON 序列化的值转为可序列化形式。
+
+    覆盖：非有限浮点（NaN/Infinity）、ctx 中附带的原始异常对象等。
+    """
+    import math
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else f"<non-finite:{obj!s}>"
+    if isinstance(obj, BaseException):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
 
 
 @asynccontextmanager
@@ -37,6 +55,14 @@ app = FastAPI(
         "并按该排程逐箱登记实际开工/完工事件（事件可晚到、按实际分钟重放，"
         "首次登记原子冻结排程基线用于偏差核算，方案被取代后实绩只读），"
         "或按各卸港允许剩余总力矩区间生成全程箱号序列字典序最小的逐港卸箱顺序；"
+        "现场可逐箱登记实际卸箱（首次登记冻结箱重、槽位力臂、堆栈与原定港区间，"
+        "可偏离预案但须满足当前港、栈顶与港区间并前瞻可行）；执行过程中港口收紧"
+        "剩余力矩安全区间时，可对已开始且未完结的执行凭全局唯一申请号、期望卸箱"
+        "进度版本与期望区间版本提交调整申请（只可收紧当前港至后续未完成港、未列"
+        "港沿用、不得改已完成港；新区间有限非倒置且包含于原生效区间并包含当前剩余"
+        "力矩，按冻结箱重/力臂/堆栈验证未卸箱仍能按港序、栈顶与逐步新区间卸完才"
+        "生效并原子递增区间版本；原冻结区间、已卸步骤与原接口字段保留，后续登记与"
+        "推荐使用生效区间，同申请号同内容重试返回首次结果）；"
         "码头临时封锁槽位时，可基于当前已确认方案、最新资料修订生成应急改配草稿"
         "（先最少换槽箱数，再最低最高占用层，最后箱号升序槽位序列字典序最小）；"
         "装船完结交接时可凭交接号、截止分钟、期望实绩版本、有效流水号集合与最大"
@@ -73,6 +99,16 @@ def _blocked_handler(_request: Request, exc: BlockedError) -> JSONResponse:
     if getattr(exc, "extra", None):
         content.update(exc.extra)
     return JSONResponse(status_code=422, content=content)
+
+
+@app.exception_handler(RequestValidationError)
+def _validation_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    # 保持 FastAPI 默认 422 结构，仅把回显中不可序列化的输入（NaN/Infinity）
+    # 转为安全字符串，避免错误响应自身无法序列化而退化成 500。
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _json_safe(exc.errors())},
+    )
 
 
 @app.get("/health", tags=["系统"], summary="健康检查")

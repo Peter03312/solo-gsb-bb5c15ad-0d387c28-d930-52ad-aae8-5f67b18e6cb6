@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select
@@ -28,6 +29,7 @@ from app.schemas import (
     ScheduleCreateIn,
     SlotDataIn,
     UnloadingCreateIn,
+    UnloadingWindowAdjustIn,
 )
 from app.scheduler import InfeasibleSchedule, Job, solve_loading
 from app.solver import (
@@ -1013,16 +1015,22 @@ def _execution_view_from_rows(
     frozen_at,
     planned_steps,
     precomputed_recommendation=None,
+    window_version=0,
+    adjustments=(),
 ):
     """组装逐港卸箱执行进度视图（GET / 登记成功响应共用）。
 
-    * frozen=True：由首次登记冻结的 boxes/ports/steps 组装（重排/取代均不影响）；
+    * frozen=True：由首次登记冻结的 boxes/steps 与**当前生效区间** ports 组装
+      （重排/取代均不影响已卸记录；区间收紧只改 ports 与 window_version）；
     * frozen=False：首次登记前，直接取当前卸箱顺序（planned_steps 含全步快照），
-      此时 progress_version=0、无已卸步骤。
+      此时 progress_version/window_version=0、无已卸步骤、无调整历史。
     每个 planned/exec step 为 9 元组：
       (step_no, order, no, slot, stack, tier, weight, arm, remaining_moment[, at])
     box 元组：(no, slot, stack, tier, weight, arm, order)
-    port 元组：(order, min, max)
+    port 元组：(order, min, max) —— 一律传当前生效区间
+    adjustment 元组：
+      (application_no, expected_progress_version, expected_window_version,
+       new_window_version, windows_json, created_at)
     """
     windows_by_order = {
         p[0]: PortWindow(
@@ -1057,6 +1065,8 @@ def _execution_view_from_rows(
         remaining = tuple(boxes)
         remaining_moment = sum(b[4] * b[5] for b in boxes)
         progress_version = 0
+        window_version = 0
+        adjustments = ()
         step_views = []
 
     current_port = min((b[6] for b in remaining), default=None)
@@ -1081,6 +1091,16 @@ def _execution_view_from_rows(
     completed = len(remaining) == 0
     read_only = plan_status == "superseded" or completed
 
+    effective_port_views = [
+        {
+            "discharge_order": p[0],
+            "min_remaining_moment": p[1],
+            "max_remaining_moment": p[2],
+        }
+        for p in sorted(ports, key=lambda x: x[0])
+    ]
+    adjustment_views = [_adjustment_view(a) for a in adjustments]
+
     return {
         "plan_id": plan_id,
         "revision_no": revision_no,
@@ -1088,16 +1108,43 @@ def _execution_view_from_rows(
         "read_only": read_only,
         "completed": completed,
         "progress_version": progress_version,
+        "window_version": window_version,
         "initial_moment": round(sum(b[4] * b[5] for b in boxes), 6),
         "remaining_moment": round(remaining_moment, 6),
         "current_port": current_port,
         "planned_next_container": planned_next,
         "frozen": frozen,
         "frozen_at": utc_iso(frozen_at) if frozen_at is not None else None,
+        "effective_ports": effective_port_views,
+        "window_adjustments": adjustment_views,
         "steps": step_views,
         "recommendation": recommendation if recommendation is not None else [],
         # 仅供服务内部在“被阻碍”场景下读取原因，不随响应输出
         "_blocked_reason": blocked_reason,
+    }
+
+
+def _adjustment_view(a) -> dict:
+    """调整留档元组/行 -> 对外历史条目。
+
+    元组结构见 _execution_view_from_rows 的 adjustments 说明。
+    """
+    application_no, exp_pv, exp_wv, new_wv, windows_json, created_at = a
+    return {
+        "application_no": application_no,
+        "expected_progress_version": exp_pv,
+        "expected_window_version": exp_wv,
+        "window_version": new_wv,
+        "ports": [
+            {
+                "discharge_order": w["discharge_order"],
+                "min_remaining_moment": w["min_remaining_moment"],
+                "max_remaining_moment": w["max_remaining_moment"],
+            }
+            for w in sorted(json.loads(windows_json),
+                            key=lambda w: w["discharge_order"])
+        ],
+        "created_at": utc_iso(created_at),
     }
 
 
@@ -1181,7 +1228,8 @@ def get_unloading_execution(db: Session, plan_id: str) -> dict:
             precomputed_recommendation=precomputed,
         )
 
-    boxes, ports, steps, planned_steps = _frozen_state_rows(execution)
+    boxes, ports, steps, planned_steps, window_version, adjustments = \
+        _frozen_state_rows(execution)
     return _execution_view_from_rows(
         plan.id,
         plan.revision_no,
@@ -1194,14 +1242,20 @@ def get_unloading_execution(db: Session, plan_id: str) -> dict:
         progress_version=execution.progress_version,
         frozen_at=execution.frozen_at,
         planned_steps=planned_steps,
+        window_version=window_version,
+        adjustments=adjustments,
     )
 
 
 def _frozen_state_rows(execution):
-    """从冻结快照读取 (boxes, ports, steps, planned_steps) 元组集合。
+    """从冻结快照读取 (boxes, ports, steps, planned_steps, ...) 元组集合。
 
-    元组结构见 _execution_view_from_rows；planned_steps 的剩余力矩列对原计划
-    无对照意义，置 0。
+    返回
+    (boxes, effective_ports, steps, planned_steps, window_version, adjustments)：
+    已卸步骤与箱重/力臂取冻结快照不变；力矩区间一律取**当前生效区间**
+    （区间调整后随之更新，原冻结区间仅留档）。元组结构见
+    _execution_view_from_rows；planned_steps 的剩余力矩列对原计划无对照
+    意义，置 0。
     """
     boxes = tuple(
         (
@@ -1215,9 +1269,9 @@ def _frozen_state_rows(execution):
         )
         for b in sorted(execution.boxes, key=lambda x: x.container_no)
     )
-    ports = tuple(
+    effective_ports = tuple(
         (p.discharge_order, p.min_remaining_moment, p.max_remaining_moment)
-        for p in sorted(execution.ports, key=lambda x: x.discharge_order)
+        for p in sorted(execution.effective_ports, key=lambda x: x.discharge_order)
     )
     steps = tuple(
         (
@@ -1249,7 +1303,21 @@ def _frozen_state_rows(execution):
         )
         for idx, no in enumerate(json.loads(execution.frozen_plan_order), start=1)
     )
-    return boxes, ports, steps, planned_steps
+    adjustments = tuple(
+        (
+            a.application_no,
+            a.expected_progress_version,
+            a.expected_window_version,
+            a.new_window_version,
+            a.windows_json,
+            a.created_at,
+        )
+        for a in sorted(execution.adjustments, key=lambda x: x.id)
+    )
+    return (
+        boxes, effective_ports, steps, planned_steps,
+        execution.window_version, adjustments,
+    )
 
 
 def execute_unloading_step(
@@ -1405,8 +1473,9 @@ def _register_unloading_step(
         cursor.execute(
             "INSERT INTO unloading_executions "
             "(plan_id, frozen_sequence_id, frozen_plan_order, initial_moment, "
-            "remaining_moment, progress_version, frozen_at, created_at) "
-            "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            "remaining_moment, progress_version, window_version, frozen_at, "
+            "created_at) "
+            "VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)",
             (
                 plan_id, sequence_id,
                 json.dumps(plan_order, ensure_ascii=False),
@@ -1432,6 +1501,16 @@ def _register_unloading_step(
             "max_remaining_moment FROM unloading_ports WHERE sequence_id = ?",
             (exec_id, sequence_id),
         )
+        # 当前生效区间初始化为原定区间（区间版本 0）；后续区间调整只改本表，
+        # 冻结区间（unloading_frozen_ports）永久留档不再变化
+        cursor.execute(
+            "INSERT INTO unloading_effective_ports "
+            "(execution_id, discharge_order, min_remaining_moment, "
+            "max_remaining_moment) "
+            "SELECT ?, discharge_order, min_remaining_moment, "
+            "max_remaining_moment FROM unloading_ports WHERE sequence_id = ?",
+            (exec_id, sequence_id),
+        )
         remaining_moment = initial_moment
         progress_version = 0
     else:
@@ -1444,7 +1523,9 @@ def _register_unloading_step(
             )
 
     boxes_all = _exec_box_tuples(cursor, exec_id)
-    ports_all = _exec_port_tuples(cursor, exec_id)
+    # 后续卸箱登记与前瞻推荐一律使用当前**生效**区间（可能已被收紧）；
+    # 冻结的原定区间只作留档（unloading_frozen_ports），不参与核算。
+    ports_all = _exec_effective_port_tuples(cursor, exec_id)
     steps_all = _exec_step_tuples(cursor, exec_id)
     box_by_no = {b[0]: b for b in boxes_all}
     window_by_order = {p[0]: p for p in ports_all}
@@ -1485,7 +1566,7 @@ def _register_unloading_step(
             422,
         )
 
-    # 卸后剩余总力矩须落入该港原定闭区间（容差随量级缩放，与求解器一致）
+    # 卸后剩余总力矩须落入该港当前生效闭区间（容差随量级缩放，与求解器一致）
     new_remaining_moment = round(remaining_moment - chosen[4] * chosen[5], 6)
     wmin, wmax = window_by_order[current_port][1], window_by_order[current_port][2]
     scale = max(1.0, abs(remaining_moment), abs(wmin), abs(wmax))
@@ -1493,7 +1574,7 @@ def _register_unloading_step(
             <= wmax + UNLOAD_EPS * scale):
         raise BusinessError(
             f"卸下 {container_no} 后剩余总力矩 {new_remaining_moment} 不在当前港"
-            f"（卸港序号 {current_port}）原定允许区间 [{wmin}, {wmax}] 内，"
+            f"（卸港序号 {current_port}）当前生效允许区间 [{wmin}, {wmax}] 内，"
             "拒绝登记",
             422,
         )
@@ -1579,13 +1660,27 @@ def _exec_box_tuples(cursor, exec_id):
     return [tuple(r) for r in cursor.fetchall()]
 
 
-def _exec_port_tuples(cursor, exec_id):
+def _exec_effective_port_tuples(cursor, exec_id):
     cursor.execute(
         "SELECT discharge_order, min_remaining_moment, max_remaining_moment "
-        "FROM unloading_frozen_ports WHERE execution_id = ? ORDER BY discharge_order",
+        "FROM unloading_effective_ports WHERE execution_id = ? "
+        "ORDER BY discharge_order",
         (exec_id,),
     )
     return [tuple(r) for r in cursor.fetchall()]
+
+
+def _exec_adjustment_tuples(cursor, exec_id):
+    cursor.execute(
+        "SELECT application_no, expected_progress_version, expected_window_version, "
+        "new_window_version, windows_json, created_at "
+        "FROM unloading_window_adjustments WHERE execution_id = ? ORDER BY id",
+        (exec_id,),
+    )
+    return [
+        (r[0], r[1], r[2], r[3], r[4], _raw_dt(r[5]))
+        for r in cursor.fetchall()
+    ]
 
 
 def _exec_step_tuples(cursor, exec_id):
@@ -1604,15 +1699,16 @@ def _exec_step_tuples(cursor, exec_id):
 def _locked_execution_view(cursor, exec_id, plan_id, revision_no, plan_status):
     """写锁内组装执行进度视图（与 GET 视图同构），用于操作成功快照。"""
     cursor.execute(
-        "SELECT remaining_moment, progress_version, frozen_at, frozen_plan_order "
-        "FROM unloading_executions WHERE id = ?",
+        "SELECT remaining_moment, progress_version, window_version, frozen_at, "
+        "frozen_plan_order FROM unloading_executions WHERE id = ?",
         (exec_id,),
     )
-    rem, ver, frozen_at, plan_order_json = cursor.fetchone()
+    rem, ver, window_ver, frozen_at, plan_order_json = cursor.fetchone()
     frozen_at = _raw_dt(frozen_at)
     boxes = tuple(_exec_box_tuples(cursor, exec_id))
-    ports = tuple(_exec_port_tuples(cursor, exec_id))
+    ports = tuple(_exec_effective_port_tuples(cursor, exec_id))
     steps = tuple(_exec_step_tuples(cursor, exec_id))
+    adjustments = tuple(_exec_adjustment_tuples(cursor, exec_id))
     box_by_no = {b[0]: b for b in boxes}
     planned_steps = tuple(
         (
@@ -1640,9 +1736,366 @@ def _locked_execution_view(cursor, exec_id, plan_id, revision_no, plan_status):
         progress_version=ver,
         frozen_at=frozen_at,
         planned_steps=planned_steps,
+        window_version=window_ver,
+        adjustments=adjustments,
     )
     view.pop("_blocked_reason", None)
     return view
+
+
+# ---------- 逐港卸箱执行：收紧剩余力矩安全区间（调整申请） ----------
+
+
+def _window_adjust_content_hash(
+    application_no: str,
+    expected_progress_version: int,
+    expected_window_version: int,
+    windows,
+) -> str:
+    """调整申请内容指纹：申请号 + 期望版本 + 区间列表规范 JSON 的 SHA-256。"""
+    payload = json.dumps(
+        {
+            "application_no": application_no,
+            "expected_progress_version": expected_progress_version,
+            "expected_window_version": expected_window_version,
+            "ports": [
+                {
+                    "discharge_order": p["discharge_order"],
+                    "min_remaining_moment": p["min_remaining_moment"],
+                    "max_remaining_moment": p["max_remaining_moment"],
+                }
+                for p in sorted(windows, key=lambda x: x["discharge_order"])
+            ],
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def adjust_unloading_windows(
+    db: Session,
+    plan_id: str,
+    payload: UnloadingWindowAdjustIn,
+) -> tuple[dict, bool]:
+    """已开始未完结的卸箱执行收紧剩余力矩安全区间，返回 (执行进度视图, 是否重试)。
+
+    申请含全局唯一申请号、期望卸箱进度版本、期望区间版本与至少一个当前港至
+    后续未完成港的新区间（未列港沿用当前生效区间；不得改已完成港）。新区间
+    上下界有限、下界不高于上界且必须包含于原生效区间；当前剩余力矩须落入
+    调整后的当前港区间；且按首次执行冻结的箱重、槽位力臂和堆栈，从未卸箱
+    验证仍能按港序、栈顶规则与逐步新区间卸完。无解返回原因且不生效（422）。
+    成功后原子递增区间版本，后续卸箱登记与推荐使用生效区间，原冻结区间、
+    已卸步骤与原有接口字段保留。同申请号同内容重试返回首次结果（200），
+    异内容、版本过期或方案已取代拒绝且不改状态（409）。
+    """
+    get_plan(db, plan_id)  # 方案未知 -> 404
+    requested = sorted(
+        [
+            {
+                "discharge_order": p.discharge_order,
+                "min_remaining_moment": p.min_remaining_moment,
+                "max_remaining_moment": p.max_remaining_moment,
+            }
+            for p in payload.ports
+        ],
+        key=lambda x: x["discharge_order"],
+    )
+    content_hash = _window_adjust_content_hash(
+        payload.application_no,
+        payload.expected_progress_version,
+        payload.expected_window_version,
+        requested,
+    )
+    windows_json = json.dumps(requested, ensure_ascii=False)
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    idempotent_hit = False
+    snapshot = None
+    try:
+        # 可行性复核可能调用 MILP，放宽该连接的锁等待，避免并发立刻 SQLITE_BUSY
+        cursor.execute("PRAGMA busy_timeout=60000")
+        cursor.execute("BEGIN IMMEDIATE")
+
+        cursor.execute("SELECT status, revision_no FROM plans WHERE id = ?", (plan_id,))
+        prow = cursor.fetchone()
+        if prow is None:
+            conn.rollback()
+            raise BusinessError(f"方案 {plan_id} 不存在", 404)
+        plan_status_locked, revision_no_locked = prow
+        if plan_status_locked == "draft":
+            conn.rollback()
+            raise ConflictError(
+                "方案尚未确认（draft），尚无卸箱计划与执行进度，拒绝区间调整申请"
+            )
+        read_only_plan = plan_status_locked == "superseded"
+
+        # 申请号全局唯一：同内容重试即使方案已取代/已完结也返回首次结果；
+        # 异内容（含复用至另一方案）一律冲突。
+        cursor.execute(
+            "SELECT a.execution_id, a.content_hash, a.response_snapshot, e.plan_id "
+            "FROM unloading_window_adjustments a "
+            "JOIN unloading_executions e ON e.id = a.execution_id "
+            "WHERE a.application_no = ?",
+            (payload.application_no,),
+        )
+        existing = cursor.fetchone()
+        if existing is not None:
+            ex_exec_id, ex_hash, ex_snapshot, ex_plan_id = existing
+            if ex_hash != content_hash or ex_plan_id != plan_id:
+                conn.rollback()
+                raise ConflictError(
+                    f"申请号 {payload.application_no} 已用于不同内容（含跨方案"
+                    "复用）的区间调整申请，同申请号异内容冲突，本次申请被拒绝"
+                    "且不生效"
+                )
+            idempotent_hit = True
+            conn.commit()
+            snapshot = json.loads(ex_snapshot)
+        else:
+            snapshot = _apply_window_adjustment(
+                cursor,
+                plan_id=plan_id,
+                revision_no=revision_no_locked,
+                plan_superseded=read_only_plan,
+                application_no=payload.application_no,
+                expected_progress_version=payload.expected_progress_version,
+                expected_window_version=payload.expected_window_version,
+                windows=requested,
+                windows_json=windows_json,
+                content_hash=content_hash,
+            )
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    return snapshot, idempotent_hit
+
+
+def _apply_window_adjustment(
+    cursor,
+    *,
+    plan_id,
+    revision_no,
+    plan_superseded,
+    application_no,
+    expected_progress_version,
+    expected_window_version,
+    windows,
+    windows_json,
+    content_hash,
+):
+    """写锁内完成单次区间调整申请的全部核对与写入；拒绝均由调用方回滚。"""
+    if plan_superseded:
+        raise ConflictError(
+            "方案修订已被新修订取代，其卸箱执行进度已冻结为只读，不再接受区间"
+            "调整申请；历史进度与调整历史仍可查询"
+        )
+
+    cursor.execute(
+        "SELECT id, remaining_moment, progress_version, window_version "
+        "FROM unloading_executions WHERE plan_id = ?",
+        (plan_id,),
+    )
+    head = cursor.fetchone()
+    if head is None:
+        # 尚无首次卸箱登记：执行未开始，不接受区间调整
+        raise ConflictError(
+            f"方案 {plan_id} 的卸箱执行尚未开始（无首次卸箱登记），区间调整"
+            "申请仅针对已开始且未完结的执行，被拒绝且不生效"
+        )
+    exec_id, remaining_moment, progress_version, window_version = head
+
+    if expected_progress_version != progress_version:
+        raise ConflictError(
+            f"期望卸箱进度版本 {expected_progress_version} 与当前进度版本 "
+            f"{progress_version} 不一致（版本过期或并发登记已推进），本次区间"
+            "调整申请被拒绝且不生效"
+        )
+    if expected_window_version != window_version:
+        raise ConflictError(
+            f"期望区间版本 {expected_window_version} 与当前区间版本 "
+            f"{window_version} 不一致（版本过期或并发调整已生效），本次区间"
+            "调整申请被拒绝且不生效"
+        )
+
+    boxes_all = _exec_box_tuples(cursor, exec_id)
+    steps_all = _exec_step_tuples(cursor, exec_id)
+    unloaded_nos = {s[2] for s in steps_all}
+    remaining_boxes = [b for b in boxes_all if b[0] not in unloaded_nos]
+    if not remaining_boxes:
+        raise ConflictError("全部箱已卸完，执行进度已完结，不再接受区间调整申请")
+
+    current_port = min(b[6] for b in remaining_boxes)
+    max_remaining_order = max(b[6] for b in remaining_boxes)
+
+    effective = {p[0]: p for p in _exec_effective_port_tuples(cursor, exec_id)}
+
+    # 逐项入参核对（422，不生效）：只能当前港至后续未完成港；新区间须为
+    # 原生效区间的闭子区间；下界不高于上界（schema 已校验，锁内再复核）。
+    for w in windows:
+        d = w["discharge_order"]
+        nmin, nmax = w["min_remaining_moment"], w["max_remaining_moment"]
+        if not (math.isfinite(nmin) and math.isfinite(nmax)):
+            raise BusinessError(
+                f"卸港 {d} 的新区间上下界须为有限数值，本次调整被拒绝且不生效",
+                422,
+            )
+        if nmin > nmax:
+            raise BusinessError(
+                f"卸港 {d} 的新区间下界 {nmin} 高于上界 {nmax}（区间倒置），"
+                "本次调整被拒绝且不生效",
+                422,
+            )
+        if d < current_port:
+            raise BusinessError(
+                f"卸港序号 {d} 已完成（当前港为 {current_port}），不得修改已"
+                "完成港区间，本次调整被拒绝且不生效",
+                422,
+            )
+        if d not in effective:
+            raise BusinessError(
+                f"卸港序号 {d} 不在本方案卸港范围内，本次调整被拒绝且不生效",
+                422,
+            )
+        if d > max_remaining_order:
+            # d 是本方案港但全部箱已卸（仅可能为末港已完成；与 current 检查互
+            # 补，正常不可达），仍按“不得改已完成港”拒绝
+            raise BusinessError(
+                f"卸港序号 {d} 已完成，不得修改已完成港区间，本次调整被拒绝"
+                "且不生效",
+                422,
+            )
+        _, emin, emax = effective[d]
+        scale = max(1.0, abs(emin), abs(emax), abs(nmin), abs(nmax))
+        if nmin < emin - UNLOAD_EPS * scale or nmax > emax + UNLOAD_EPS * scale:
+            raise BusinessError(
+                f"卸港 {d} 的新区间 [{nmin}, {nmax}] 未包含于当前生效区间 "
+                f"[{emin}, {emax}]（只可收紧），本次调整被拒绝且不生效",
+                422,
+            )
+
+    # 合并未列港沿用当前生效区间，得到调整后全量区间
+    adjusted = {
+        d: PortWindow(
+            discharge_order=d,
+            min_remaining_moment=w[1],
+            max_remaining_moment=w[2],
+        )
+        for d, w in effective.items()
+    }
+    for w in windows:
+        d = w["discharge_order"]
+        adjusted[d] = PortWindow(
+            discharge_order=d,
+            min_remaining_moment=w["min_remaining_moment"],
+            max_remaining_moment=w["max_remaining_moment"],
+        )
+
+    # 当前剩余力矩须落入调整后的当前港区间（显式核对，保证收紧不否决现状）
+    cur = adjusted[current_port]
+    cscale = max(
+        1.0, abs(remaining_moment),
+        abs(cur.min_remaining_moment), abs(cur.max_remaining_moment),
+    )
+    if not (cur.min_remaining_moment - UNLOAD_EPS * cscale <= remaining_moment
+            <= cur.max_remaining_moment + UNLOAD_EPS * cscale):
+        raise BusinessError(
+            "调整后当前港（卸港序号 "
+            f"{current_port}）区间 [{cur.min_remaining_moment}, "
+            f"{cur.max_remaining_moment}] 不包含当前剩余总力矩 "
+            f"{round(remaining_moment, 6)}，本次调整被拒绝且不生效；"
+            "无解原因：当前剩余总力矩不在调整后当前港区间内",
+            422,
+        )
+
+    # 按首次执行冻结的箱重、槽位力臂和堆栈，从未卸箱验证仍能按港序、
+    # 栈顶规则与逐步新区间卸完
+    recommendation, infeasible_reason = _remaining_recommendation(
+        remaining_boxes, adjusted
+    )
+    if recommendation is None:
+        raise BusinessError(
+            "区间调整后，从当前未卸箱无法再按卸港顺序、堆栈先后与各港新区间"
+            f"卸完全部剩余箱，本次调整被拒绝且不生效；无解原因：{infeasible_reason}",
+            422,
+        )
+
+    new_window_version = window_version + 1
+    now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+
+    # 原子更新生效区间（未列港原样保留）与区间版本；原冻结区间与已卸步骤不动
+    cursor.executemany(
+        "UPDATE unloading_effective_ports SET min_remaining_moment = ?, "
+        "max_remaining_moment = ? WHERE execution_id = ? AND discharge_order = ?",
+        [
+            (w["min_remaining_moment"], w["max_remaining_moment"],
+             exec_id, w["discharge_order"])
+            for w in windows
+        ],
+    )
+    cursor.execute(
+        "UPDATE unloading_executions SET window_version = ? WHERE id = ?",
+        (new_window_version, exec_id),
+    )
+
+    # 同一事务内留档调整申请；先取调整后视图快照（含本条历史），再落台账
+    cursor.execute(
+        "INSERT INTO unloading_window_adjustments "
+        "(execution_id, application_no, expected_progress_version, "
+        "expected_window_version, new_window_version, windows_json, "
+        "response_snapshot, content_hash, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, '', ?, ?)",
+        (
+            exec_id, application_no, expected_progress_version,
+            expected_window_version, new_window_version, windows_json,
+            content_hash, now,
+        ),
+    )
+    adjustment_id = cursor.lastrowid
+    snapshot = _locked_execution_view(
+        cursor, exec_id, plan_id, revision_no, plan_status="confirmed"
+    )
+    cursor.execute(
+        "UPDATE unloading_window_adjustments SET response_snapshot = ? WHERE id = ?",
+        (json.dumps(snapshot, ensure_ascii=False), adjustment_id),
+    )
+    return snapshot
+
+
+def list_window_adjustments(db: Session, plan_id: str) -> list[dict]:
+    """列出某方案卸箱执行的区间调整历史（按生效先后升序）；执行不存在 404。"""
+    get_plan(db, plan_id)
+    execution = db.scalar(
+        select(models.UnloadingExecution).where(
+            models.UnloadingExecution.plan_id == plan_id
+        )
+    )
+    if execution is None:
+        raise BusinessError(
+            f"方案 {plan_id} 的卸箱执行尚未开始，无区间调整历史", 404
+        )
+    rows = [
+        (
+            a.application_no,
+            a.expected_progress_version,
+            a.expected_window_version,
+            a.new_window_version,
+            a.windows_json,
+            a.created_at,
+        )
+        for a in sorted(execution.adjustments, key=lambda x: x.id)
+    ]
+    return [_adjustment_view(r) for r in rows]
 
 
 

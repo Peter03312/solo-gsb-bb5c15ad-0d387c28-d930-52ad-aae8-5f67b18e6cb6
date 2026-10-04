@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -14,6 +15,10 @@ def _require_nonempty_str(v: str, label: str) -> str:
     if not isinstance(v, str) or not v.strip():
         raise ValueError(f"{label}不能为空")
     return v.strip()
+
+
+def _is_finite(v: float) -> bool:
+    return isinstance(v, (int, float)) and math.isfinite(v)
 
 
 # ---------- 录入：槽位资料 ----------
@@ -384,6 +389,91 @@ class UnloadingRecommendedStepOut(BaseModel):
     remaining_moment: float
 
 
+class UnloadingWindowPortIn(BaseModel):
+    """区间调整申请中的单个卸港新区间（只可收紧、只可针对当前港及后续未完成港）。"""
+
+    discharge_order: int = Field(..., ge=1, description="卸港序号；不得为已完成港")
+    min_remaining_moment: float = Field(..., description="新区间下限；须为有限数值")
+    max_remaining_moment: float = Field(..., description="新区间上限；须为有限数值")
+
+    @field_validator("min_remaining_moment", "max_remaining_moment", mode="before")
+    @classmethod
+    def _finite_before(cls, v):
+        # 在字段转为 float 前以原始输入核对有限性：NaN/Infinity 通过类型转换
+        # 后，校验错误回显里的 input 仍为非有限浮点，会使错误响应无法序列化。
+        if isinstance(v, float) and not _is_finite(v):
+            raise ValueError(
+                "新区间上下界须为有限数值（不得为 NaN/Infinity/-Infinity）"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _window(self) -> "UnloadingWindowPortIn":
+        if self.min_remaining_moment > self.max_remaining_moment:
+            raise ValueError(
+                f"卸港 {self.discharge_order} 的新区间下限 "
+                f"{self.min_remaining_moment} 不得高于上限 "
+                f"{self.max_remaining_moment}（区间倒置）"
+            )
+        return self
+
+
+class UnloadingWindowAdjustIn(BaseModel):
+    """收紧剩余力矩安全区间的调整申请：方案号取路径参数。"""
+
+    application_no: str = Field(
+        ..., description="全局唯一申请号；同号同内容重试返回首次结果，同号异内容冲突"
+    )
+    expected_progress_version: int = Field(
+        ..., ge=0, description="期望卸箱进度版本；与当前不一致返回 409"
+    )
+    expected_window_version: int = Field(
+        ..., ge=0, description="期望区间版本；初始为 0，每次调整生效后 +1；与当前不一致返回 409"
+    )
+    ports: list[UnloadingWindowPortIn] = Field(
+        ..., min_length=1,
+        description="至少一个当前港至后续未完成港的新区间；未列港沿用当前生效区间",
+    )
+
+    @model_validator(mode="after")
+    def _unique(self) -> "UnloadingWindowAdjustIn":
+        orders = [p.discharge_order for p in self.ports]
+        if len(set(orders)) != len(orders):
+            dup = sorted({d for d in orders if orders.count(d) > 1})
+            raise ValueError(f"调整区间卸港序号重复提交：{', '.join(map(str, dup))}")
+        return self
+
+    @field_validator("application_no")
+    @classmethod
+    def _application_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "申请号")
+
+
+class UnloadingEffectivePortOut(BaseModel):
+    """某卸港当前生效的剩余总力矩闭区间。"""
+
+    discharge_order: int
+    min_remaining_moment: float
+    max_remaining_moment: float
+
+
+class UnloadingWindowAdjustmentOut(BaseModel):
+    """单次生效的区间调整历史条目。"""
+
+    application_no: str
+    expected_progress_version: int = Field(
+        ..., description="申请提交时核对的期望进度版本"
+    )
+    expected_window_version: int = Field(
+        ..., description="申请提交时核对的期望区间版本"
+    )
+    window_version: int = Field(..., description="本次生效后的区间版本")
+    ports: list[UnloadingEffectivePortOut] = Field(
+        ..., description="本次申请列出的调整区间（按卸港序号升序）"
+    )
+    created_at: str
+
+
 class UnloadingExecutionOut(BaseModel):
     plan_id: str
     revision_no: int
@@ -393,6 +483,11 @@ class UnloadingExecutionOut(BaseModel):
     read_only: bool = Field(..., description="true=方案已被取代/全部卸完，不再接受登记")
     completed: bool = Field(..., description="true=全部剩余箱已卸完")
     progress_version: int = Field(..., description="进度版本：首次登记前为 0，每登记一箱 +1")
+    # 默认值仅为兼容升级前遗留操作快照的同号重试（其快照无下列新字段）；
+    # 新请求的视图始终显式携带这些字段。
+    window_version: int = Field(
+        default=0, description="区间版本：首次冻结为 0（原定区间），每次区间调整生效后 +1"
+    )
     initial_moment: float
     remaining_moment: float = Field(..., description="当前剩余总力矩")
     current_port: int | None = Field(
@@ -403,6 +498,13 @@ class UnloadingExecutionOut(BaseModel):
     )
     frozen: bool = Field(..., description="true=计划及箱重/力臂/港区间已被首次登记冻结")
     frozen_at: str | None = None
+    effective_ports: list[UnloadingEffectivePortOut] = Field(
+        default_factory=list,
+        description="各卸港当前生效的剩余总力矩闭区间（首次冻结为原定区间，调整后按版本更新）"
+    )
+    window_adjustments: list[UnloadingWindowAdjustmentOut] = Field(
+        default_factory=list, description="区间调整历史（按生效先后升序）；从未调整为空"
+    )
     steps: list[UnloadingExecStepOut]
     recommendation: list[UnloadingRecommendedStepOut] = Field(
         ..., description="从当前状态出发可行的剩余推荐顺序；全部卸完为空"

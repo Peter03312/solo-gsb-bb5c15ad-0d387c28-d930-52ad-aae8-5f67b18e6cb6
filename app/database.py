@@ -103,3 +103,32 @@ def _apply_lightweight_migrations() -> None:
                     text("ALTER TABLE loading_actual_events ADD COLUMN corrected "
                          "BOOLEAN NOT NULL DEFAULT 0")
                 )
+
+    # 卸箱执行：区间版本列与生效区间表为后续版本新增。
+    # 新表由 create_all 直接建出；历史库只需补列并把冻结原定区间回填为
+    # 区间版本 0 的生效区间（尚未开始的执行无冻结区间，无需回填）。
+    added_exec = columns("unloading_executions")
+    with engine.begin() as conn:
+        if added_exec and "window_version" not in added_exec:
+            conn.execute(
+                text("ALTER TABLE unloading_executions ADD COLUMN window_version "
+                     "INTEGER NOT NULL DEFAULT 0")
+            )
+    if added_exec and "unloading_effective_ports" in inspector.get_table_names():
+        # 历史库的生效区间表刚由 create_all 建出且为空：把每个已开始执行的
+        # 冻结原定区间回填为区间版本 0 的生效区间。
+        with engine.begin() as conn:
+            has_any = conn.execute(
+                text("SELECT 1 FROM unloading_effective_ports LIMIT 1")
+            ).first()
+            if has_any is None:
+                conn.execute(
+                    text(
+                        "INSERT INTO unloading_effective_ports "
+                        "(execution_id, discharge_order, min_remaining_moment, "
+                        "max_remaining_moment) "
+                        "SELECT f.execution_id, f.discharge_order, "
+                        "f.min_remaining_moment, f.max_remaining_moment "
+                        "FROM unloading_frozen_ports f"
+                    )
+                )
